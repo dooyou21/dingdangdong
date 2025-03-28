@@ -1,86 +1,357 @@
+use anyhow::Result;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Sample, Stream};
+use device_query::{DeviceQuery, DeviceState, Keycode};
+use ringbuf::traits::Split;
+use ringbuf::{traits::*, HeapRb};
+use std::collections::HashMap;
+use std::thread;
 use std::time::Duration;
-use rodio::{OutputStream, Source};
 
-struct WavetableOscillator {
-    sample_rate: u32,
-    wave_table: Vec<f32>,
-    index: f32,
-    index_increment: f32,
+// 오실리에이터 유형
+#[derive(Debug, Clone, Copy)]
+enum Oscillator {
+    Sine,
+    Square,
+    Sawtooth,
+    Triangle,
 }
 
-impl WavetableOscillator {
-    fn new(sample_rate: u32, wave_table: Vec<f32>) -> WavetableOscillator {
-        return WavetableOscillator { 
-            sample_rate,
-            wave_table,
-            index: 0.0,
-            index_increment: 0.0, 
+// 노트 정보를 저장할 구조체
+#[derive(Debug, Clone)]
+struct Note {
+    frequency: f32,
+    is_playing: bool,
+    oscillator: Oscillator,
+    amplitude: f32,
+}
+
+impl Note {
+    fn new(frequency: f32, oscillator: Oscillator) -> Self {
+        Self {
+            frequency,
+            is_playing: false,
+            oscillator,
+            amplitude: 0.0,
         }
     }
 
-    fn set_frequency(&mut self, frequency: f32) {
-        self.index_increment = frequency * self.wave_table.len() as f32 / self.sample_rate as f32;
-    }
+    // 주파수에 따른 샘플 생성
+    fn generate_sample(&mut self, phase: &mut f32, sample_rate: f32) -> f32 {
+        if !self.is_playing {
+            return 0.0;
+        }
 
-    fn get_sample(&mut self) -> f32 {
-        let sample = self.lerp();
-        self.index += self.index_increment;
-        self.index %= self.wave_table.len() as f32;
-        return sample;
-    }
-    fn lerp(&self) -> f32 {
-        let truncated_index = self.index as usize;
-        let next_index = (truncated_index + 1) % self.wave_table.len();
+        // 위상 증가
+        *phase += self.frequency / sample_rate;
+        if *phase >= 1.0 {
+            *phase -= 1.0;
+        }
 
-        let next_index_weight = self.index - truncated_index as f32;
-        let truncated_index_weight = 1.0 - next_index_weight;
-
-        return truncated_index_weight * self.wave_table[truncated_index] +
-            next_index_weight * self.wave_table[next_index];
-    }
-}
-
-impl Iterator for WavetableOscillator {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<f32> {
-        return Some(self.get_sample());
-    }
-}
-
-impl Source for WavetableOscillator {
-    fn channels(&self) -> u16 {
-        return 1;
-    }
-    fn sample_rate(&self) -> u32 {
-        return self.sample_rate;
-    }
-
-    fn current_frame_len(&self) -> Option<usize> {
-        return None;
-    }
-    fn total_duration(&self) -> Option<Duration> {
-        return None;
+        // 오실리에이터 유형에 따른 파형 생성
+        let sample = match self.oscillator {
+            Oscillator::Sine => (2.0 * std::f32::consts::PI * *phase).sin(),
+            Oscillator::Square => {
+                if *phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            Oscillator::Sawtooth => 2.0 * *phase - 1.0,
+            Oscillator::Triangle => {
+                if *phase < 0.5 {
+                    4.0 * *phase - 1.0
+                } else {
+                    3.0 - 4.0 * *phase
+                }
+            }
+        };
+        sample * self.amplitude
     }
 }
 
-fn main() {
-    let wave_table_size = 64;
-    let mut wave_table: Vec<f32> = Vec::with_capacity(wave_table_size);
-    for n in 0..wave_table_size {
-        wave_table.push((2.0 * std::f32::consts::PI * n as f32 /
-        wave_table_size as f32).sin());
+// 키보드 키와 주파수 매핑
+fn create_key_frequency_map() -> HashMap<Keycode, f32> {
+    let mut map = HashMap::new();
+
+    map.insert(Keycode::Z, 261.63); // C4
+    map.insert(Keycode::S, 277.18); // C#4
+    map.insert(Keycode::X, 293.66); // D4
+    map.insert(Keycode::D, 311.13); // D#4
+    map.insert(Keycode::C, 329.63); // E4
+    map.insert(Keycode::V, 349.23); // F4
+    map.insert(Keycode::G, 369.99); // F#4
+    map.insert(Keycode::B, 392.99); // G4
+    map.insert(Keycode::H, 415.30); // G#4
+    map.insert(Keycode::N, 440.00); // A4
+    map.insert(Keycode::J, 466.16); // A#4
+    map.insert(Keycode::M, 493.88); // B4
+    map.insert(Keycode::Comma, 523.25); // C5
+
+    map
+}
+
+// ADSR 엔벨로프
+struct Envelope {
+    attack_time: f32,
+    decay_time: f32,
+    sustain_level: f32,
+    release_time: f32,
+    current_level: f32,
+    phase: EnvelopePhase,
+    sample_rate: f32,
+    samples_processed: usize,
+}
+
+enum EnvelopePhase {
+    Idle,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+impl Envelope {
+    fn new(
+        attack_time: f32,
+        decay_time: f32,
+        sustain_level: f32,
+        release_time: f32,
+        sample_rate: f32,
+    ) -> Self {
+        Self {
+            attack_time,
+            decay_time,
+            sustain_level,
+            release_time,
+            current_level: 0.0,
+            phase: EnvelopePhase::Idle,
+            sample_rate,
+            samples_processed: 0,
+        }
     }
 
-    let mut oscillator = WavetableOscillator::new(44100, wave_table);
-    oscillator.set_frequency(440.0);
+    fn trigger(&mut self) {
+        self.phase = EnvelopePhase::Attack;
+        self.samples_processed = 0;
+    }
 
+    fn release(&mut self) {
+        self.phase = EnvelopePhase::Release;
+        self.samples_processed = 0;
+    }
 
-    let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+    fn process(&mut self) -> f32 {
+        match self.phase {
+            EnvelopePhase::Idle => 0.0,
+            EnvelopePhase::Attack => {
+                let attack_samples = (self.attack_time * self.sample_rate) as usize;
+                if attack_samples == 0 {
+                    self.current_level = 1.0;
+                    self.phase = EnvelopePhase::Decay;
+                    self.samples_processed = 0;
+                } else {
+                    self.current_level = self.samples_processed as f32 / attack_samples as f32;
+                    if self.samples_processed >= attack_samples {
+                        self.phase = EnvelopePhase::Decay;
+                        self.samples_processed = 0;
+                    }
+                }
+                self.samples_processed += 1;
+                self.current_level
+            }
+            EnvelopePhase::Decay => {
+                let decay_samples = (self.decay_time * self.sample_rate) as usize;
+                if decay_samples == 0 {
+                    self.current_level = self.sustain_level;
+                    self.phase = EnvelopePhase::Sustain;
+                } else {
+                    self.current_level = 1.0
+                        - (1.0 - self.sustain_level)
+                            * (self.samples_processed as f32 / decay_samples as f32);
+                    if self.samples_processed >= decay_samples {
+                        self.phase = EnvelopePhase::Sustain;
+                    }
+                }
+                self.samples_processed += 1;
+                self.current_level
+            }
+            EnvelopePhase::Sustain => self.sustain_level,
+            EnvelopePhase::Release => {
+                let release_samples = (self.release_time * self.sample_rate) as usize;
+                if release_samples == 0 {
+                    self.current_level = 0.0;
+                    self.phase = EnvelopePhase::Idle;
+                } else {
+                    self.current_level = self.sustain_level
+                        * (1.0 - self.samples_processed as f32 / release_samples as f32);
+                    if self.samples_processed >= release_samples {
+                        self.current_level = 0.0;
+                        self.phase = EnvelopePhase::Idle;
+                    }
+                }
+                self.samples_processed += 1;
+                self.current_level
+            }
+        }
+    }
+}
 
-    let _result = stream_handle.play_raw(oscillator.convert_samples());
+// 오디오 스트림 생성
+fn create_audio_stream(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    mut consumer: impl Consumer<Item = (Keycode, bool)>,
+) -> Result<Stream> {
+    let sample_rate = config.sample_rate().0 as f32;
+    let channels = config.channels() as usize;
 
-    std::thread::sleep(Duration::from_secs(5));
+    // 노트 맵 생성
+    let key_frequency_map = create_key_frequency_map();
 
+    // 활성화된 노트 추적
+    let mut notes: HashMap<Keycode, (Note, f32, Envelope)> = HashMap::new();
 
+    // 오실레이터 선택 (기본적으로 사인파)
+    let oscillator_type = Oscillator::Sine;
+
+    let err_fn = |err| eprintln!("Audio Stream Error: {}", err);
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            &config.config(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                process_audio::<f32>(
+                    data,
+                    channels,
+                    &key_frequency_map,
+                    &mut notes,
+                    &mut consumer,
+                    sample_rate,
+                    oscillator_type,
+                )
+            },
+            err_fn,
+            None,
+        )?,
+        // 다른 포맷 필요한경우 여기에 추가
+        _ => return Err(anyhow::anyhow!("Cannot handle this format")),
+    };
+
+    Ok(stream)
+}
+
+// 오디오 처리 함수
+fn process_audio<T: Sample>(
+    data: &mut [T],
+    channels: usize,
+    key_frequency_map: &HashMap<Keycode, f32>,
+    notes: &mut HashMap<Keycode, (Note, f32, Envelope)>,
+    consumer: &mut impl Consumer<Item = (Keycode, bool)>,
+    sample_rate: f32,
+    oscillator_type: Oscillator,
+) {
+    // 키보드 이벤트 처리
+    while let Some((key, pressed)) = consumer.try_pop() {
+        if let Some(&frequency) = key_frequency_map.get(&key) {
+            if pressed {
+                if !notes.contains_key(&key) {
+                    let mut note = Note::new(frequency, oscillator_type);
+                    note.is_playing = true;
+                    let envelope = Envelope::new(0.01, 0.1, 0.7, 0.2, sample_rate);
+                    notes.insert(key, (note, 0.0, envelope));
+                }
+
+                if let Some((note, _, envelope)) = notes.get_mut(&key) {
+                    note.is_playing = true;
+                    envelope.trigger();
+                }
+            } else {
+                if let Some((note, _, envelope)) = notes.get_mut(&key) {
+                    envelope.release();
+                }
+            }
+        }
+    }
+
+    // 오디오 샘플 생성
+    for frame in data.chunks_mut(channels) {
+        let mut mix = 0.0;
+
+        // 모든 활성화된 노트에 대해 샘플 생성
+        for (_, (note, phase, envelope)) in notes.iter_mut() {
+            let env_value = envelope.process();
+            let mut note_clone = note.clone();
+            note_clone.amplitude = env_value * 0.2;
+            let sample = note_clone.generate_sample(phase, sample_rate);
+            mix += sample;
+        }
+
+        // 채널 수에 따라 모든 채널에 같은 값 할당
+        for channel in frame.iter_mut() {
+            *channel = Sample::from(&(mix));
+        }
+
+        // 더이상 사용하지 않는 노트 제거
+        notes.retain(|_, (_, _, envelope)| match envelope.phase {
+            EnvelopePhase::Idle => false,
+            _ => true,
+        });
+    }
+}
+
+fn main() -> Result<()> {
+    // 오디오 호스트 및 디바이스 설정
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .expect("Cannot find output device");
+    let config = device
+        .default_output_config()
+        .expect("Cannot find output config");
+
+    println!("Default output device: {:?}", device.name());
+    println!("Default output config: {:?}", config);
+
+    // 키보드 이벤트 처리를 위한 링 버퍼
+    let ring_buffer = HeapRb::<(Keycode, bool)>::new(1024);
+    let (mut producer, consumer) = ring_buffer.split();
+
+    // 오디오 스트림 생성 및 시작
+    let stream = create_audio_stream(&device, &config, consumer)?;
+    stream.play()?;
+
+    // 키보드 상태 모니터링
+    let device_state = DeviceState::new();
+    let mut previous_keys = Vec::new();
+
+    println!("Minimal Toy Synthesizer!");
+    println!("Use Z-M keys to play");
+    println!("Press Esc to exit");
+
+    loop {
+        let keys = device_state.get_keys();
+
+        for key in &keys {
+            if !previous_keys.contains(key) {
+                producer.try_push((*key, true)).unwrap();
+            }
+        }
+
+        for key in &previous_keys {
+            if !keys.contains(key) {
+                producer.try_push((*key, false)).unwrap()
+            }
+        }
+
+        if keys.contains(&Keycode::Escape) {
+            break;
+        }
+
+        previous_keys = keys;
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    Ok(())
 }
