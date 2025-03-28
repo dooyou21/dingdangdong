@@ -202,7 +202,7 @@ impl Envelope {
 fn create_audio_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
-    mut consumer: impl Consumer<Item = (Keycode, bool)>,
+    mut consumer: impl Consumer<Item = (Keycode, bool)> + Send + 'static,
 ) -> Result<Stream> {
     let sample_rate = config.sample_rate().0 as f32;
     let channels = config.channels() as usize;
@@ -222,15 +222,53 @@ fn create_audio_stream(
         cpal::SampleFormat::F32 => device.build_output_stream(
             &config.config(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                process_audio::<f32>(
-                    data,
-                    channels,
-                    &key_frequency_map,
-                    &mut notes,
-                    &mut consumer,
-                    sample_rate,
-                    oscillator_type,
-                )
+                // 키보드 이벤트 처리
+                while let Some((key, pressed)) = consumer.try_pop() {
+                    if let Some(&frequency) = key_frequency_map.get(&key) {
+                        if pressed {
+                            if !notes.contains_key(&key) {
+                                let mut note = Note::new(frequency, oscillator_type);
+                                note.is_playing = true;
+                                let envelope = Envelope::new(0.01, 0.1, 0.7, 0.2, sample_rate);
+                                notes.insert(key, (note, 0.0, envelope));
+                            }
+
+                            if let Some((note, _, envelope)) = notes.get_mut(&key) {
+                                note.is_playing = true;
+                                envelope.trigger();
+                            }
+                        } else {
+                            if let Some((note, _, envelope)) = notes.get_mut(&key) {
+                                envelope.release();
+                            }
+                        }
+                    }
+                }
+
+                // 오디오 샘플 생성
+                for frame in data.chunks_mut(channels) {
+                    let mut mix = 0.0;
+
+                    // 모든 활성화된 노트에 대해 샘플 생성
+                    for (_, (note, phase, envelope)) in notes.iter_mut() {
+                        let env_value = envelope.process();
+                        let mut note_clone = note.clone();
+                        note_clone.amplitude = env_value * 0.2;
+                        let sample = note_clone.generate_sample(phase, sample_rate);
+                        mix += sample;
+                    }
+
+                    // 채널 수에 따라 모든 채널에 같은 값 할당
+                    for channel in frame.iter_mut() {
+                        *channel = Sample::to_sample(mix);
+                    }
+
+                    // 더이상 사용하지 않는 노트 제거
+                    notes.retain(|_, (_, _, envelope)| match envelope.phase {
+                        EnvelopePhase::Idle => false,
+                        _ => true,
+                    });
+                }
             },
             err_fn,
             None,
@@ -240,65 +278,6 @@ fn create_audio_stream(
     };
 
     Ok(stream)
-}
-
-// 오디오 처리 함수
-fn process_audio<T: Sample>(
-    data: &mut [T],
-    channels: usize,
-    key_frequency_map: &HashMap<Keycode, f32>,
-    notes: &mut HashMap<Keycode, (Note, f32, Envelope)>,
-    consumer: &mut impl Consumer<Item = (Keycode, bool)>,
-    sample_rate: f32,
-    oscillator_type: Oscillator,
-) {
-    // 키보드 이벤트 처리
-    while let Some((key, pressed)) = consumer.try_pop() {
-        if let Some(&frequency) = key_frequency_map.get(&key) {
-            if pressed {
-                if !notes.contains_key(&key) {
-                    let mut note = Note::new(frequency, oscillator_type);
-                    note.is_playing = true;
-                    let envelope = Envelope::new(0.01, 0.1, 0.7, 0.2, sample_rate);
-                    notes.insert(key, (note, 0.0, envelope));
-                }
-
-                if let Some((note, _, envelope)) = notes.get_mut(&key) {
-                    note.is_playing = true;
-                    envelope.trigger();
-                }
-            } else {
-                if let Some((note, _, envelope)) = notes.get_mut(&key) {
-                    envelope.release();
-                }
-            }
-        }
-    }
-
-    // 오디오 샘플 생성
-    for frame in data.chunks_mut(channels) {
-        let mut mix = 0.0;
-
-        // 모든 활성화된 노트에 대해 샘플 생성
-        for (_, (note, phase, envelope)) in notes.iter_mut() {
-            let env_value = envelope.process();
-            let mut note_clone = note.clone();
-            note_clone.amplitude = env_value * 0.2;
-            let sample = note_clone.generate_sample(phase, sample_rate);
-            mix += sample;
-        }
-
-        // 채널 수에 따라 모든 채널에 같은 값 할당
-        for channel in frame.iter_mut() {
-            *channel = Sample::from(&(mix));
-        }
-
-        // 더이상 사용하지 않는 노트 제거
-        notes.retain(|_, (_, _, envelope)| match envelope.phase {
-            EnvelopePhase::Idle => false,
-            _ => true,
-        });
-    }
 }
 
 fn main() -> Result<()> {
