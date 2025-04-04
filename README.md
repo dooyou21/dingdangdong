@@ -4,6 +4,12 @@
 Toy synthesizer made with Rust
 just for fun
 
+
+
+https://github.com/user-attachments/assets/c2a4c324-f3cc-40f7-84fc-efe3ef5d39be
+
+
+
 # Plan
 - [ ] GUI - Visualize pressed keyboard, can press with click
 - [ ] sustain on/off switch
